@@ -16,6 +16,7 @@ package infrastructure
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	extensionscontroller "github.com/gardener/gardener/extensions/pkg/controller"
@@ -55,9 +56,13 @@ func (a *actuator) updateProviderStatus(
 	status *v1alpha1.InfrastructureStatus,
 	state *runtime.RawExtension,
 ) error {
+
 	patch := client.MergeFrom(infra.DeepCopy())
 	infra.Status.ProviderStatus = &runtime.RawExtension{Object: status}
 	infra.Status.State = state
+	for _, natIP := range status.Networks.NatIPs {
+		infra.Status.EgressCIDRs = append(infra.Status.EgressCIDRs, fmt.Sprintf("%s/32", natIP.IP))
+	}
 	return a.client.Status().Patch(ctx, infra, patch)
 }
 

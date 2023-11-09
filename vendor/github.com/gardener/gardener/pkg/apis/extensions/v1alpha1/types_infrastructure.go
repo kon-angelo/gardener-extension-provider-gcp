@@ -89,4 +89,8 @@ type InfrastructureStatus struct {
 	// be statically defined in the Shoot resource but must be computed dynamically.
 	// +optional
 	NodesCIDR *string `json:"nodesCIDR,omitempty"`
+	// EgressCIDRs is a list of stable CIDRs from which the shoot traffic originates, meaning that it is the source IP of all shoot outgoing traffic. For certain environments the egress
+	// IPs may not be stable in which case the extension controller can forgo  populating this field.
+	// +optional
+	EgressCIDRs []string `json:"egressCIDRs,omitempty"`
 }

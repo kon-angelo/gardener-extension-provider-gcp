@@ -1194,6 +1194,11 @@ func (in *InfrastructureStatus) DeepCopyInto(out *InfrastructureStatus) {
 		*out = new(string)
 		**out = **in
 	}
+	if in.EgressCIDRs != nil {
+		in, out := &in.EgressCIDRs, &out.EgressCIDRs
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	return
 }
 
