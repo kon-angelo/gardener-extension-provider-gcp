@@ -16,6 +16,7 @@ package infrastructure
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	extensionscontroller "github.com/gardener/gardener/extensions/pkg/controller"
@@ -29,7 +30,7 @@ import (
 
 	"github.com/gardener/gardener-extension-provider-gcp/pkg/apis/gcp/v1alpha1"
 	"github.com/gardener/gardener-extension-provider-gcp/pkg/controller/infrastructure/infraflow"
-	"github.com/gardener/gardener-extension-provider-gcp/pkg/gcp"
+	gcptypes "github.com/gardener/gardener-extension-provider-gcp/pkg/gcp"
 	"github.com/gardener/gardener-extension-provider-gcp/pkg/internal"
 	infrainternal "github.com/gardener/gardener-extension-provider-gcp/pkg/internal/infrastructure"
 )
@@ -49,16 +50,15 @@ func NewActuator(mgr manager.Manager, disableProjectedTokenMount bool) infrastru
 	}
 }
 
-func (a *actuator) updateProviderStatus(
+func (a *actuator) updateProviderStatusAndState(
 	ctx context.Context,
 	infra *extensionsv1alpha1.Infrastructure,
 	status *v1alpha1.InfrastructureStatus,
 	state *runtime.RawExtension,
 ) error {
-	patch := client.MergeFrom(infra.DeepCopy())
 	infra.Status.ProviderStatus = &runtime.RawExtension{Object: status}
 	infra.Status.State = state
-	return a.client.Status().Patch(ctx, infra, patch)
+	return a.client.Status().Patch(ctx, infra, client.MergeFrom(infra.DeepCopy()))
 }
 
 func (a *actuator) cleanupTerraformerResources(ctx context.Context, log logr.Logger, infra *extensionsv1alpha1.Infrastructure) error {
@@ -72,6 +72,54 @@ func (a *actuator) cleanupTerraformerResources(ctx context.Context, log logr.Log
 	}
 
 	return tf.RemoveTerraformerFinalizerFromConfig(ctx) // Explicitly clean up the terraformer finalizers
+}
+
+func hasFlowState(status extensionsv1alpha1.InfrastructureStatus) (bool, error) {
+	if status.State == nil {
+		return false, nil
+	}
+
+	flowState := runtime.TypeMeta{}
+	stateJson, err := status.State.MarshalJSON()
+	if err != nil {
+		return false, err
+	}
+
+	if err := json.Unmarshal(stateJson, &flowState); err != nil {
+		return false, err
+	}
+
+	if flowState.GroupVersionKind().GroupVersion() == v1alpha1.SchemeGroupVersion {
+		return true, nil
+	}
+
+	infraState := &infrainternal.InfrastructureState{}
+	if err := json.Unmarshal(status.State.Raw, infraState); err != nil {
+		return false, err
+	}
+
+	if infraState.TerraformState != nil {
+		return false, nil
+	}
+
+	return false, fmt.Errorf("unknown infrastructure state format")
+}
+
+// HasFlowAnnotation returns true if the new flow reconciler should be used for the reconciliation.
+func HasFlowAnnotation(infrastructure *extensionsv1alpha1.Infrastructure, cluster *extensionscontroller.Cluster) bool {
+	if hasShootAnnotation(infrastructure, cluster, gcptypes.AnnotationKeyUseTerraform) {
+		return false
+	}
+
+	if hasShootAnnotation(infrastructure, cluster, gcptypes.AnnotationKeyUseFlow) {
+		return true
+	}
+
+	return cluster.Seed != nil && cluster.Seed.Annotations != nil && strings.EqualFold(cluster.Seed.Annotations[gcptypes.AnnotationKeyUseFlow], "true")
+}
+
+func hasShootAnnotation(infrastructure *extensionsv1alpha1.Infrastructure, cluster *extensionscontroller.Cluster, key string) bool {
+	return (infrastructure.Annotations != nil && strings.EqualFold(infrastructure.Annotations[key], "true")) || (cluster.Shoot != nil && cluster.Shoot.Annotations != nil && strings.EqualFold(cluster.Shoot.Annotations[key], "true"))
 }
 
 func getFlowStateFromInfrastructureStatus(infrastructure *extensionsv1alpha1.Infrastructure) (*infraflow.FlowState, error) {
@@ -105,7 +153,7 @@ func shouldUseFlow(infra *extensionsv1alpha1.Infrastructure, cluster *extensions
 		return true, nil
 	}
 
-	return strings.EqualFold(infra.Annotations[gcp.AnnotationKeyUseFlow], "true") ||
-		(cluster.Shoot != nil && strings.EqualFold(cluster.Shoot.Annotations[gcp.AnnotationKeyUseFlow], "true")) ||
-		(cluster.Seed != nil && strings.EqualFold(cluster.Seed.Labels[gcp.SeedLabelKeyUseFlow], "true")), nil
+	return strings.EqualFold(infra.Annotations[gcptypes.AnnotationKeyUseFlow], "true") ||
+		(cluster.Shoot != nil && strings.EqualFold(cluster.Shoot.Annotations[gcptypes.AnnotationKeyUseFlow], "true")) ||
+		(cluster.Seed != nil && strings.EqualFold(cluster.Seed.Labels[gcptypes.SeedLabelKeyUseFlow], "true")), nil
 }

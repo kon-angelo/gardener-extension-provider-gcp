@@ -47,7 +47,7 @@ func (a *actuator) reconcile(ctx context.Context, log logr.Logger, infra *extens
 			return err
 		}
 
-		return a.updateProviderStatus(ctx, infra, status, state)
+		return a.updateProviderStatusAndState(ctx, infra, status, state)
 	}
 
 	// Flow case
@@ -65,5 +65,5 @@ func (a *actuator) reconcile(ctx context.Context, log logr.Logger, infra *extens
 		return err
 	}
 
-	return a.updateProviderStatus(ctx, infra, status, state)
+	return a.updateProviderStatusAndState(ctx, infra, status, state)
 }

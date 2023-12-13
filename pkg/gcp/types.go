@@ -93,6 +93,8 @@ const (
 	// AnnotationKeyUseFlow marks how the infrastructure should be reconciled. When this is used reconciliation with flow
 	// will take place. Otherwrise, Terraformer will be used.
 	AnnotationKeyUseFlow = "gcp.provider.extensions.gardener.cloud/use-flow"
+	// AnnotationKeyUseTF is the annotation key used to enable reconciliation using terraformer.
+	AnnotationKeyUseTerraform = "gcp.provider.extensions.gardener.cloud/use-tf"
 	// SeedLabelKeyUseFlow is the label for seeds to enable flow reconciliation for all of its shoots if value is `true`
 	// or for new shoots only with value `new`
 	SeedLabelKeyUseFlow = AnnotationKeyUseFlow
