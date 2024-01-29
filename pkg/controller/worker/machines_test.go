@@ -374,7 +374,9 @@ var _ = Describe("Machines", func() {
 
 				setup := func(disableExternalIP bool) {
 					gceInstanceLabels := map[string]interface{}{
-						"name": name,
+						"name":                  name,
+						"machine_image_name":    machineImageName,
+						"machine_image_version": machineImageVersion,
 					}
 					for k, v := range labels {
 						gceInstanceLabels[SanitizeGcpLabel(k)] = SanitizeGcpLabelValue(v)
