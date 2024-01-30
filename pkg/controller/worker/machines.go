@@ -179,8 +179,8 @@ func (w *workerDelegate) generateMachineConfig(_ context.Context) error {
 		gceInstanceLabels := getGceInstanceLabels(w.worker.Name, pool)
 
 		if pool.MachineImage.Name != "" && pool.MachineImage.Version != "" {
-			gceInstanceLabels["machine_image_name"] = pool.MachineImage.Name
-			gceInstanceLabels["machine_image_version"] = pool.MachineImage.Version
+			gceInstanceLabels["machine_image_name"] = SanitizeGcpLabelValue(pool.MachineImage.Name)
+			gceInstanceLabels["machine_image_version"] = SanitizeGcpLabelValue(pool.MachineImage.Version)
 		}
 
 		isLiveMigrationAllowed := true
