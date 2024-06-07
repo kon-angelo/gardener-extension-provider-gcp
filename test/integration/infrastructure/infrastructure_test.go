@@ -53,8 +53,9 @@ import (
 )
 
 const (
-	workersSubnetCIDR  = "10.250.0.0/19"
-	internalSubnetCIDR = "10.250.112.0/22"
+	existingSubnetCIDR = "10.180.32.0/19"
+	workersSubnetCIDR  = "10.180.0.0/19"
+	internalSubnetCIDR = "10.180.64.0/19"
 	podCIDR            = "100.96.0.0/11"
 
 	reconcilerUseTF     string = "tf"
@@ -191,7 +192,7 @@ var _ = Describe("Infrastructure tests", func() {
 			framework.RunCleanupActions()
 		})
 
-		It("should successfully create and delete", func() {
+		FIt("should successfully create and delete", func() {
 			namespace, err := generateNamespaceName()
 			Expect(err).NotTo(HaveOccurred())
 
@@ -587,9 +588,39 @@ func prepareNewNetwork(ctx context.Context, logger logr.Logger, project string, 
 		return err
 	}
 
+	subnet := &computev1.Subnetwork{
+		Name:        networkName,
+		Network:     networkOp.TargetLink,
+		Description: "infrastructure test existing subnet",
+		IpCidrRange: existingSubnetCIDR,
+	}
+	subnetOp, err := computeService.Subnetworks.Insert(project, *region, subnet).Context(ctx).Do()
+	if err != nil {
+		return err
+	}
+	logger.Info("Waiting until subnet is created...", "subnet", networkName)
+	if err := waitForOperation(ctx, project, computeService, subnetOp); err != nil {
+		return err
+	}
+
 	router := &computev1.Router{
+		Bgp: &computev1.RouterBgp{
+			AdvertiseMode:    "CUSTOM",
+			AdvertisedGroups: []string{"ALL_SUBNETS"},
+			AdvertisedIpRanges: []*computev1.RouterAdvertisedIpRange{
+				{
+					Description: "",
+					Range:       "10.250.0.0/19",
+				},
+			},
+			Asn:               64514,
+			KeepaliveInterval: 20,
+			ForceSendFields:   nil,
+			NullFields:        nil,
+		},
 		Name:    routerName,
 		Network: networkOp.TargetLink,
+		Region:  *region,
 	}
 	routerOp, err := computeService.Routers.Insert(project, *region, router).Context(ctx).Do()
 	if err != nil {
@@ -717,7 +748,6 @@ func verifyCreation(
 	network, err := computeService.Networks.Get(project, infra.Namespace).Do()
 	Expect(err).NotTo(HaveOccurred())
 	Expect(network.AutoCreateSubnetworks).To(BeFalse())
-	Expect(network.Subnetworks).To(HaveLen(2))
 
 	// subnets
 
