@@ -16,11 +16,11 @@ type BackupBucketConfig struct {
 	metav1.TypeMeta
 
 	// Immutability defines the immutability config for the backup bucket.
-	Immutability ImmutableConfig
+	Immutability *ImmutabilityConfig
 }
 
-// ImmutableConfig represents the immutability configuration for a backup bucket.
-type ImmutableConfig struct {
+// ImmutabilityConfig represents the immutability configuration for a backup bucket.
+type ImmutabilityConfig struct {
 	// RetentionType specifies the type of retention for the backup bucket.
 	// Currently allowed values are:
 	// - "bucket": The retention policy applies to the entire bucket.

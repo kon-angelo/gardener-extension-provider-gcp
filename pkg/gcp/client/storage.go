@@ -25,7 +25,10 @@ const (
 // StorageClient is an interface which must be implemented by GCS clients.
 type StorageClient interface {
 	// GCS wrappers
-	CreateOrUpdateBucket(ctx context.Context, bucketName, region string, config *apisgcp.BackupBucketConfig) error
+	Attrs(ctx context.Context, bucketName string) (*storage.BucketAttrs, error)
+	CreateBucket(ctx context.Context, attrs *storage.BucketAttrs) error
+	UpdateBucket(ctx context.Context, bucketName, region string, attrs storage.BucketAttrsToUpdate) (*storage.BucketAttrs, error)
+	LockBucket(ctx context.Context, bucketName string) error
 	DeleteBucketIfExists(ctx context.Context, bucketName string) error
 	DeleteObjectsWithPrefix(ctx context.Context, bucketName, prefix string) error
 }
@@ -45,6 +48,27 @@ func NewStorageClient(ctx context.Context, serviceAccount *gcp.ServiceAccount) (
 		client:         client,
 		serviceAccount: serviceAccount,
 	}, nil
+}
+
+func (s *storageClient) Attrs(ctx context.Context, bucketName string) (*storage.BucketAttrs, error) {
+	return s.client.Bucket(bucketName).Attrs(ctx)
+}
+
+func (s *storageClient) LockBucket(ctx context.Context, bucketName string) error {
+	bucket := s.client.Bucket(bucketName)
+	attrs, err := bucket.Attrs(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get attributes for bucket %q while attempting to lock retention policy: %w", bucket.BucketName(), err)
+	}
+
+	if err := bucket.If(storage.BucketConditions{MetagenerationMatch: attrs.MetaGeneration}).LockRetentionPolicy(ctx); err != nil {
+		return fmt.Errorf("failed to lock retention policy for bucket %q: %w", bucket.BucketName(), err)
+	}
+	return nil
+}
+func (s *storageClient) UpdateBucket(ctx context.Context, bucketName, region string, attrs storage.BucketAttrsToUpdate) (*storage.BucketAttrs, error) {
+	return s.client.Bucket(bucketName).Update(ctx, attrs)
+
 }
 
 // NewStorageClientFromSecretRef creates a new storage client from the given <secretRef>.
@@ -79,38 +103,8 @@ func (s *storageClient) CreateOrUpdateBucket(ctx context.Context, bucketName, re
 
 	return s.updateBucketIfNeeded(ctx, bucket, attrs, config)
 }
-
-func (s *storageClient) createBucket(ctx context.Context, bucket *storage.BucketHandle, region string, config *apisgcp.BackupBucketConfig) error {
-	var retentionPolicy *storage.RetentionPolicy
-	if config != nil {
-		retentionPolicy = &storage.RetentionPolicy{
-			RetentionPeriod: config.Immutability.RetentionPeriod.Duration,
-		}
-	}
-
-	bucketAttrs := &storage.BucketAttrs{
-		Location:        region,
-		RetentionPolicy: retentionPolicy,
-		UniformBucketLevelAccess: storage.UniformBucketLevelAccess{
-			Enabled: true,
-		},
-		SoftDeletePolicy: &storage.SoftDeletePolicy{
-			RetentionDuration: 0,
-		},
-	}
-
-	if err := bucket.Create(ctx, s.serviceAccount.ProjectID, bucketAttrs); err != nil {
-		return fmt.Errorf("failed to create bucket %q: %w", bucket.BucketName(), err)
-	}
-
-	// Lock the retention policy if specified
-	if config != nil && config.Immutability.Locked {
-		if err := s.lockBucketRetentionPolicy(ctx, bucket); err != nil {
-			return fmt.Errorf("failed to lock retention policy for bucket %q: %w", bucket.BucketName(), err)
-		}
-	}
-
-	return nil
+func (s *storageClient) CreateBucket(ctx context.Context, attrs *storage.BucketAttrs) error {
+	return s.client.Bucket(attrs.Name).Create(ctx, s.serviceAccount.ProjectID, attrs)
 }
 
 func (s *storageClient) updateBucketIfNeeded(ctx context.Context, bucket *storage.BucketHandle, attrs *storage.BucketAttrs, config *apisgcp.BackupBucketConfig) error {

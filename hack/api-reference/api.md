@@ -54,8 +54,8 @@ string
 <td>
 <code>immutability</code></br>
 <em>
-<a href="#gcp.provider.extensions.gardener.cloud/v1alpha1.ImmutableConfig">
-ImmutableConfig
+<a href="#gcp.provider.extensions.gardener.cloud/v1alpha1.ImmutabilityConfig">
+ImmutabilityConfig
 </a>
 </em>
 </td>
@@ -803,14 +803,14 @@ int32
 </tr>
 </tbody>
 </table>
-<h3 id="gcp.provider.extensions.gardener.cloud/v1alpha1.ImmutableConfig">ImmutableConfig
+<h3 id="gcp.provider.extensions.gardener.cloud/v1alpha1.ImmutabilityConfig">ImmutabilityConfig
 </h3>
 <p>
 (<em>Appears on:</em>
 <a href="#gcp.provider.extensions.gardener.cloud/v1alpha1.BackupBucketConfig">BackupBucketConfig</a>)
 </p>
 <p>
-<p>ImmutableConfig represents the immutability configuration for a backup bucket.</p>
+<p>ImmutabilityConfig represents the immutability configuration for a backup bucket.</p>
 </p>
 <table>
 <thead>

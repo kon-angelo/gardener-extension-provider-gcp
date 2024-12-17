@@ -14,10 +14,14 @@ import (
 
 // ValidateBackupBucketConfig validates a BackupBucketConfig object.
 func ValidateBackupBucketConfig(config *apisgcp.BackupBucketConfig, fldPath *field.Path) field.ErrorList {
-	if config == nil {
-		return nil
-	}
 	allErrs := field.ErrorList{}
+	if config == nil {
+		return allErrs
+	}
+
+	if config.Immutability == nil {
+		return allErrs
+	}
 
 	// Currently, only 'bucket' type is supported. In the future, 'object' type will be supported.
 	if config.Immutability.RetentionType != "bucket" {
