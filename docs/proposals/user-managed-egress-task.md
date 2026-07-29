@@ -39,6 +39,7 @@ the current `HEAD`.
   - [3.10 Metadata tagging on BYO resources](#310-metadata-tagging-on-byo-resources)
   - [3.11 Deletion / teardown](#311-deletion--teardown)
   - [3.12 Configuration patterns](#312-configuration-patterns)
+  - [3.13 Folding the internal subnet into the workers subnet](#313-folding-the-internal-subnet-into-the-workers-subnet)
 - [4. Open questions to resolve before writing the proposal](#4-open-questions-to-resolve-before-writing-the-proposal)
 - [5. Deliverable and workflow](#5-deliverable-and-workflow)
 - [6. Potential future issues with upstream components](#6-potential-future-issues-with-upstream-components)
@@ -487,21 +488,34 @@ a shared-VPC-only best-effort behavior.
 
 ### 2.5 `ingress-gce`
 
-`ingress-gce` (the GKE ingress controller for L7 external LBs) mutates firewall
-rules, forwarding rules, backend services, health checks, URL maps, and target
-proxies. It creates firewall rules with names like `k8s-fw-l7-*` that allow
-GCP's LB proxy ranges to reach node ports.
+**Correction to an earlier assumption.** `ingress-gce` **is** deployed by this
+extension, gated on `IsDualStackEnabled(cluster.Shoot.Spec.Networking,
+cluster.Shoot.Status.Networking)` at `valuesprovider.go:484-491`. The chart
+lives at `charts/internal/seed-controlplane/charts/ingress-gce/` and is
+conditionally enabled via `requirements.yaml:14-17` on
+`ingress-gce.enabled`. So for dual-stack shoots the extension ships:
 
-**In Gardener today, `ingress-gce` is not deployed by this extension.** Only
-`cloud-provider-gcp` (the CCM) is deployed. Users who need L7 GCP LBs must
-opt in to `ingress-gce` themselves as a shoot add-on. This means:
+- `cloud-provider-config` (for the main CCM) — see §1.6, points its
+  `subnetwork-name` at the **`PurposeInternal`** subnet.
+- `cloud-provider-config-ingress-gce` (for the `ingress-gce` controller)
+  — separate ConfigMap at
+  `charts/internal/cloud-provider-config/templates/cloud-provider-config-ingress-gce.yaml`,
+  points its `subnetwork-name` at the **`PurposeNodes`** subnet (via the
+  `subNetworkNameNodes` value at `valuesprovider.go:436-437`).
 
-- The BYO design does **not** need to reason about `ingress-gce` firewall
-  mutations as a Gardener-owned surface.
-- We should mention it in "user responsibilities" and in the deletion-filter
-  section — `ensureFirewallRulesDeleted`'s `k8s`-prefix + `TargetTag` filter
-  already picks up ingress-gce-authored rules, so if a user does deploy
-  `ingress-gce`, its rules are still garbage-collected on shoot deletion.
+**This means the two upstream controllers we ship reference *different*
+subnets today.** The main CCM sees the internal subnet as its default; the
+`ingress-gce` controller sees the workers subnet as its default. Any BYO or
+subnet-consolidation design has to reconcile this — see §3.1 (new goal) and
+§3.13 (new subsection).
+
+Beyond that: `ingress-gce` mutates the same class of GCP resources described
+in §2.2 and §2.3 (firewall rules, custom routes) plus L7-specific resources
+(forwarding rules, backend services, health checks, URL maps, target
+proxies, NEGs). Its firewall rules are named `k8s-fw-l7-*` and are also
+tag-scoped to the shoot technical ID via the `node-tags` value in
+`gce.conf` — so our existing `ensureFirewallRulesDeleted` filter
+(`ensure.go:658-663`) picks them up on shoot delete.
 
 ### 2.6 Shared VPC (XPN)
 
@@ -555,7 +569,30 @@ step in the BYO design (see §3.1).
    be forced to name their subnet's IPv4 pod secondary range exactly
    `ipv4-pod-cidr`, which is an unreasonable naming constraint to inherit from
    an internal implementation detail (see §3.2 note).
-6. **Deferred to future work:**
+6. **Fold the internal subnet into the workers subnet** (new goal). The
+   `PurposeInternal` subnet Gardener creates today (from `Networks.Internal`)
+   is a plain regular subnet with no special GCP `purpose` (`ensure_utils.go:99-122`
+   sets none) — it is used solely to give the CCM's `subnetwork-name` in
+   `cloud.conf` a target for internal-LB IP allocation. GCP internal
+   pass-through LBs can allocate their forwarding-rule IP from **any** subnet
+   in the region, so a separate subnet is not architecturally required.
+   Additionally, the extension already ships `ingress-gce` for dual-stack
+   shoots and points **its** `subnetwork-name` at the workers subnet
+   (`PurposeNodes`, via `subNetworkNameNodes` at `valuesprovider.go:436`),
+   which means we already have an inconsistency between the two upstream
+   controllers' subnet references. This goal aligns them and simplifies BYO.
+
+   Concretely, this means: (a) BYO mode never accepts a separate internal
+   subnet field; the workers subnet is the reference for both controllers.
+   (b) Managed mode continues to honor `Networks.Internal` for backward
+   compatibility, but the field is **deprecated** and new shoots should not
+   set it. (c) The main CCM's `subnetwork-name` is remapped from
+   `PurposeInternal` to `PurposeNodes` (§3.7, §3.13). Users who explicitly
+   want internal LBs to allocate IPs from a specific range use the
+   Service-level annotation `networking.gke.io/internal-load-balancer-subnet`
+   (or its historical `cloud.google.com/load-balancer-subnet` equivalent —
+   verify at proposal time).
+7. **Deferred to future work:**
    - Shared VPC (`network-project-id` / host-project). Requires emitting a new
      field in `cloudprovider.conf` and an IAM preflight against the host
      project. Noted so `Networks.VPC` can grow a `HostProjectID` field without
@@ -565,16 +602,21 @@ step in the BYO design (see §3.1).
      no BYO API field is required to make BYO topologies work — the extension
      simply stops creating its own untargeted allow rules in BYO mode, and the
      user takes over. See §3.8.
-   - BYO internal subnet (`Networks.SubnetInternal`) — needed only if a user
-     wants an internal LB subnet under BYO. Deferred pending demand.
-   - BYO services subnet (`Networks.SubnetServices`) for dual-stack shoots — as
-     above.
+   - BYO services subnet (`Networks.SubnetServices`) for dual-stack shoots.
+     Deferred pending demand.
    - Per-zone BYO subnets. GCP subnets are regional (span all zones in a
      region), so the per-zone BYO shape from other providers does not apply
      here. Deferred pending demand.
+   - Proxy-only subnet (GCP `purpose: REGIONAL_MANAGED_PROXY`) — required for
+     Internal HTTP(S) Load Balancer via `ingress-gce`. Gardener does not
+     provision this today in either managed or BYO mode; users of Internal
+     Ingress must pre-provision one and point their `Ingress` resources at it
+     via annotations. Document as a known gap.
    - In-place transitions between managed and BYO modes on an existing shoot.
    - `configure-cloud-routes=false` knob for shoots using overlay CNIs — would
      stop the CCM from writing per-node routes into the user's VPC.
+   - Full removal of `Networks.Internal` — after the deprecation window,
+     migrate existing shoots off the separate internal subnet.
 
 ### 3.2 API additions
 
@@ -771,24 +813,30 @@ whether the shoot is in BYO mode. Specific behaviors:
 - `project-id` — unchanged (from credentials).
 - `network-name` — resolves to `InfrastructureStatus.Networks.VPC.Name` in BYO
   mode; unchanged code path.
-- `subnetwork-name` — currently mapped to `PurposeInternal`. **Bug-adjacent:**
-  in BYO mode `PurposeInternal` won't exist, and even in managed mode today it
-  only exists when `Networks.Internal` was set on the shoot. Two options:
-  1. **Preferred:** change `subnetwork-name` to always map to `PurposeNodes`.
-     This is what the CCM actually wants (the subnet where worker VMs live).
-     Audit for regressions on existing shoots — the current behavior may be a
-     legacy artifact.
-  2. Alternative: introduce a separate `subnetwork-name` value derived
-     specifically from `PurposeNodes` for BYO mode; keep the internal-subnet
-     mapping for managed mode. Uglier but zero regression risk.
-
-  This decision should be resolved before writing the proposal — see §4, Q1.
-- `secondary-range-name` — **new emission**, only when the shoot is dual-stack
-  and `Networks.SubnetNodes.PodSecondaryRangeName` is set (BYO mode) or when
-  managed dual-stack emits the hardcoded `ipv4-pod-cidr` string. Verify against
-  `cloud-provider-gcp` behavior whether this is required for the CCM's IPAM to
-  find the right range or whether the range is discovered another way. If the
-  CCM works without it, this emission can be skipped.
+- `subnetwork-name` (main CCM `cloud-provider-config`) — **remapped from
+  `PurposeInternal` to `PurposeNodes`** as part of the "fold internal into
+  workers" goal (§3.1 item 6, §3.13). This aligns the main CCM with the
+  already-shipping `ingress-gce` config (which uses `PurposeNodes` today at
+  `cloud-provider-config-ingress-gce.yaml:11-12`), fixes the empty-subnet
+  edge case for managed shoots that never set `Networks.Internal`, and makes
+  BYO-subnet mode trivially work — the workers subnet always exists so the
+  field is always populated. Existing shoots that set `Networks.Internal`
+  continue to reconcile green because the internal subnet still exists in
+  the VPC; they simply no longer have their internal LB IPs allocated from
+  a different subnet. Users who care about that partition can migrate to
+  the Service-level annotation
+  `networking.gke.io/internal-load-balancer-subnet`.
+- `subnetwork-name` (ingress-gce `cloud-provider-config-ingress-gce`) —
+  unchanged; already uses `PurposeNodes` (`subNetworkNameNodes` at
+  `valuesprovider.go:436-437`, template at
+  `cloud-provider-config-ingress-gce.yaml:11-12`).
+- `secondary-range-name` — **new emission**, only when the shoot is
+  dual-stack and `Networks.SubnetNodes.PodSecondaryRangeName` is set (BYO
+  mode) or when managed dual-stack emits the hardcoded `ipv4-pod-cidr`
+  string. Verify against `cloud-provider-gcp` behavior whether this is
+  required for the CCM's IPAM to find the right range or whether the range
+  is discovered via `Node.Spec.PodCIDRs`. If the CCM works without it, this
+  emission can be skipped.
 - `node-tags` — unchanged; still the shoot technical ID.
 - **Future:** shared-VPC support would add `network-project-id`; deferred out
   of v1.
@@ -990,6 +1038,118 @@ The user pre-created `my-workers` with `stackType: IPV4_IPV6`, an external
 `/64` IPv6 CIDR assigned, and a secondary range `my-pods = 10.96.0.0/11`. The
 extension's runtime validator verifies all three.
 
+### 3.13 Folding the internal subnet into the workers subnet
+
+This is the technical detail behind Goal §3.1 item 6. It affects both managed
+and BYO modes.
+
+**Current state.** The extension creates up to three subnets in managed mode:
+
+| Purpose | Field | Created by | Used for |
+|---|---|---|---|
+| `PurposeNodes` | `Networks.Workers` (required) | `ensureNodesSubnet` at `ensure.go:275` | worker VMs, alias-IP pod ranges (dual-stack), ingress-gce `subnetwork-name` reference |
+| `PurposeInternal` | `Networks.Internal` (optional) | `ensureInternalSubnet` at `ensure.go:325` | main CCM `subnetwork-name` reference — default subnet for internal LB IP allocation |
+| `PurposeServices` | (dual-stack only) | `ensureServicesSubnet` at `ensure.go:370` | dual-stack IPv6 services CIDR |
+
+The internal subnet is a **plain regular subnet** — it does not set GCP's own
+`subnetwork.purpose` field (which would take values like `PRIVATE`,
+`REGIONAL_MANAGED_PROXY`, `PRIVATE_SERVICE_CONNECT`, `PRIVATE_NAT`). See
+`targetSubnetState` at `ensure_utils.go:99-122` for confirmation — the
+constructed `compute.Subnetwork` struct sets `Name`, `IpCidrRange`, `Network`,
+`Description`, `PrivateIpGoogleAccess: false`, optional flow-log config, and
+dual-stack fields, but no `Purpose` and no `Role`.
+
+**Why the separation exists today.** Purely a legacy design choice. The main
+CCM's `subnetwork-name` in `gce.conf` provides the default subnet for
+internal-LB forwarding-rule IP allocation. Historically Gardener created a
+small, dedicated subnet for this purpose to keep worker VM IP space and
+LB IP space partitioned. Nothing in GCP requires this partition — internal
+pass-through LBs happily allocate their forwarding-rule IP from any subnet in
+the region, including the workers subnet.
+
+**Existing inconsistency.** The extension already ships `ingress-gce` for
+dual-stack shoots (§2.5) and points its `subnetwork-name` at the workers
+subnet — see `subNetworkNameNodes` at `valuesprovider.go:436-437` and the
+template at `cloud-provider-config-ingress-gce.yaml:11-12`. So today, in a
+dual-stack shoot with `Networks.Internal` set:
+
+- The main CCM sees the internal subnet as default.
+- `ingress-gce` sees the workers subnet as default.
+
+That is a latent misconfiguration risk — nothing prevents an admin from
+setting an internal-subnet CIDR that is disjoint from what ingress-gce
+expects, and no code cross-validates the two.
+
+**Verification of the CCM's behavior.** `cloud-provider-gcp` reads
+`subnetwork-name` from `gce.conf` and uses it as `Config.Subnetwork` inside
+its load-balancer controller. For internal `Service type=LoadBalancer`
+(`cloud.google.com/load-balancer-type: Internal`), when the Service does not
+specify a subnet annotation, the forwarding rule is created against
+`Config.Subnetwork`. The value must be a real regional subnet in the region
+the LB is being created in. There is **no** requirement that this subnet be
+distinct from the workers subnet — it just has to exist.
+
+**Impact of the change.**
+
+- **BYO mode**: only one subnet is referenceable — the BYO worker subnet.
+  Both the main CCM and `ingress-gce` (if enabled) get pointed at it. No
+  separate BYO internal-subnet field is needed. Simpler API, simpler
+  validation, aligned upstream configs.
+- **New managed shoots**: `Networks.Internal` is deprecated. New shoots
+  should leave it unset. The main CCM's `subnetwork-name` gets the workers
+  subnet, matching `ingress-gce`. No extra subnet is created — one fewer
+  resource in the user's VPC per shoot.
+- **Existing managed shoots with `Networks.Internal` set**: continue to
+  reconcile green. The internal subnet is not deleted (it is still owned by
+  Gardener), and the reconciler continues to keep it healthy as long as the
+  field is set. But `subnetwork-name` in the main CCM's config **is** flipped
+  to `PurposeNodes` on the next reconcile. Practical impact for those shoots:
+  new internal LBs allocate their forwarding-rule IP from the workers subnet
+  instead of the internal subnet. Existing internal LBs continue to work
+  (their forwarding rule already has an allocated IP that is not touched).
+
+**Migration.** For operators who want to fully remove the internal subnet
+from an existing shoot:
+
+1. Ensure no `Service type=LoadBalancer` with `cloud.google.com/load-balancer-type:
+   Internal` has a forwarding rule whose IP lies in the `Networks.Internal`
+   CIDR (or add the `networking.gke.io/internal-load-balancer-subnet`
+   annotation to point them at the workers subnet, then re-create the
+   Service).
+2. Remove `Networks.Internal` from the shoot spec. Validation at
+   `pkg/apis/gcp/validation/infrastructure.go:223-225` currently forbids
+   this transition (`ValidateImmutableField` — internal subnet is immutable
+   once set). This proposal relaxes that rule to allow removal (setting to
+   nil), while still forbidding a change to a different CIDR.
+3. On next reconcile, `ensureInternalSubnet` (which already handles the
+   deletion path at `ensure.go:328-329`) deletes the internal subnet.
+
+**Alternatives considered.**
+
+- **Keep the two subnets separate, add BYO `SubnetInternal`.** Rejected —
+  doubles the BYO API surface, doubles the validation matrix, does not fix
+  the existing CCM-vs-ingress-gce inconsistency, and provides no value that
+  the annotation-based per-Service override does not already provide.
+- **Fold in BYO only, keep managed as-is.** Rejected — leaves the
+  CCM-vs-ingress-gce inconsistency in place for managed shoots. If we're
+  changing the mapping in BYO we should change it in managed too, both to
+  fix the inconsistency and to keep the two code paths uniform.
+- **Fold silently, no deprecation of `Networks.Internal`.** Rejected —
+  users who explicitly configured `Networks.Internal` did so for a reason
+  (usually IP partitioning). Silently ignoring the field would be
+  user-hostile. Deprecation with a warning is honest.
+
+**Validation impact.**
+
+- New managed shoots setting `Networks.Internal` — accept but log a
+  deprecation warning (via the admission validator). Alternatively, reject
+  with a message pointing at the workers-subnet-based approach; more
+  disruptive.
+- BYO shoots (`Networks.SubnetNodes != nil`) — `Networks.Internal` remains
+  forbidden (§3.4).
+- Existing shoots — no change to validation; the immutability rule is
+  relaxed only to permit the specific removal path (`old != nil, new == nil`).
+
 ---
 
 ## 4. Open questions to resolve before writing the proposal
@@ -997,17 +1157,23 @@ extension's runtime validator verifies all three.
 Ranked by design impact. Any of these can flip the proposal shape and should
 be surfaced explicitly to reviewers.
 
-- **Q1** — `subnetwork-name` in `cloud.conf` currently maps to `PurposeInternal`
-  (§1.6, `valuesprovider.go:736-739`). Is that intentional? For BYO mode we
-  want `PurposeNodes`. If we change it to `PurposeNodes` universally, we need
-  to test regression on shoots that use `Networks.Internal` today. Blocks §3.7.
+- **Q1** — Regression testing for the `subnetwork-name` remap from
+  `PurposeInternal` to `PurposeNodes` (§3.7, §3.13). The remap is the core
+  mechanic behind the "fold internal into workers" goal. Existing shoots with
+  `Networks.Internal` set continue to reconcile green but their new internal
+  LBs will start allocating from the workers subnet instead. Need to
+  enumerate the set of existing shoots that would be affected and check
+  whether any depend on the current partition. If some do, the transition
+  needs a per-Service annotation migration story.
 - **Q3** — Shared VPC: defer entirely, or add a stub `Networks.VPC.HostProjectID
   *string` in v1 with a `Forbidden` validation until wired end-to-end?
   Zero-cost future compatibility with a small API-surface commitment.
-- **Q4** — Confirm `ingress-gce` is not shipped as a Gardener add-on in any
-  standard path. The investigation strongly suggests only `cloud-provider-gcp`
-  is deployed, but worth a grep of `charts/` and Gardener core before we make
-  the claim in the proposal body.
+- **Q4** — Resolved: `ingress-gce` IS shipped by this extension, but only for
+  dual-stack shoots (`valuesprovider.go:484-491`, gated on
+  `IsDualStackEnabled(...)`). See §2.5 for the correction. This changes the
+  §6.2 framing: `ingress-gce` is a Gardener-owned surface for dual-stack
+  shoots, so cleanup semantics and version pinning are our responsibility for
+  those shoots.
 - **Q7** — Do we need CCM `secondary-range-name` in `cloudprovider.conf` at
   all? Managed dual-stack works today without emitting it (the range is
   discovered from `Node.Spec.PodCIDRs`). If BYO dual-stack works the same way,
@@ -1076,7 +1242,8 @@ be surfaced explicitly to reviewers.
    - Bastion (§3.9)
    - Metadata labeling on BYO resources (§3.10)
 6. Configuration patterns (§3.12) — the four `InfrastructureConfig` examples
-7. Migration and immutability rules
+7. Folding the internal subnet into the workers subnet (§3.13)
+8. Migration and immutability rules
 8. User responsibilities — pre-provision the subnet, pre-provision equivalent
    firewall rules (`gcloud` recipe), decide their own egress topology, grant
    Gardener's SA the compute-instance / firewall / route permissions the CCM
@@ -1085,14 +1252,16 @@ be surfaced explicitly to reviewers.
 10. Documentation plan — new `docs/usage/user-managed-egress.md`, plus a
     subsection in `docs/usage/usage.md`
 11. Acceptance criteria grouped as: regression / valid BYO / rejected configs
-    / immutability / runtime invariants / deletion / metadata
+    / immutability / runtime invariants / deletion / metadata / internal-fold
 12. Alternatives considered — explicit `OutboundType` enum; BYO firewall rules
     as a first-class field; BYO Cloud NAT / BYO Cloud Router in BYO-subnet
-    mode; auto-discovery of the pod secondary range name; shared-VPC in v1
+    mode; auto-discovery of the pod secondary range name; keeping internal
+    subnet separate; shared-VPC in v1
 13. Open / Resolved questions (§4)
-14. Out of scope (future work) — shared VPC, BYO internal / services subnets,
-    per-zone BYO subnets, in-place mode transitions,
-    `configure-cloud-routes=false` for overlay-CNI users
+14. Out of scope (future work) — shared VPC, BYO services subnet, proxy-only
+    subnet for Internal HTTP(S) Ingress, per-zone BYO subnets, in-place mode
+    transitions, `configure-cloud-routes=false` for overlay-CNI users, full
+    removal of `Networks.Internal` after deprecation window
 
 ---
 
@@ -1141,50 +1310,51 @@ watch-items.
 
 ### 6.2 `ingress-gce` — the main watch-item
 
-`ingress-gce` is **not deployed by this extension today** (§2.5), but the BYO
-mode makes it much more likely that users will install it themselves — because
-BYO users often want L7 external LBs (Cloud Armor, IAP, WAF, global anycast).
-Any user who does so, or any future Gardener add-on that pulls it in, drops
-`ingress-gce` into a shoot whose extension has zero knowledge of it. This
-creates specific risks.
+**Correction from earlier draft.** `ingress-gce` **is** shipped by this
+extension for dual-stack shoots (§2.5). Any dual-stack shoot — managed or
+BYO — has `ingress-gce` running in the seed control plane and reconciling GCP
+resources on behalf of `Ingress` objects created in the shoot. For BYO shoots,
+this is even more consequential because all of those writes land in the
+user's VPC / project.
 
-- **Unknown resource classes written to the user's VPC / project.** Beyond
-  what the CCM writes, `ingress-gce` creates: global forwarding rules,
-  backend services, health checks (both legacy and modern), URL maps, target
-  HTTP(S) proxies, SSL certificates (google-managed), NEGs (Network Endpoint
-  Groups) in each worker zone, and firewall rules to admit GCP LB proxy
-  ranges. Some of these are global project-scoped, not VPC-scoped, so they
-  survive VPC deletion.
+- **Wide surface of resources.** Beyond what the CCM writes, `ingress-gce`
+  creates: global forwarding rules, backend services, health checks (both
+  legacy and modern), URL maps, target HTTP(S) proxies, SSL certificates
+  (google-managed), NEGs (Network Endpoint Groups) in each worker zone, and
+  firewall rules to admit GCP LB proxy ranges. Some are project-scoped
+  (global forwarding rules, backends, URL maps, target proxies), not
+  VPC-scoped, so they survive VPC deletion.
 
-- **Our cleanup filters may or may not catch its firewall rules.**
-  `ingress-gce` names its firewall rules `k8s-fw-l7-<hash>` (matches our
-  `k8s`-prefix filter) and targets them by node tag from `gce.conf` (which
-  equals the shoot's technical ID). In principle,
-  `ensureFirewallRulesDeleted` picks them up. This has never been tested in
-  Gardener — we should add an integration test with `ingress-gce` installed as
-  an add-on to confirm the cleanup path works end-to-end. If a future
-  `ingress-gce` version changes its naming convention (there is precedent —
-  the `-l7-` infix was added around v1.7), the filter breaks silently.
+- **Our cleanup filter should catch its firewall rules but is untested.**
+  `ingress-gce` names its firewall rules `k8s-fw-l7-*` and targets them via
+  `TargetTags` = the shoot's technical ID (from
+  `subNetworkNameNodes`-adjacent config paths). In principle,
+  `ensureFirewallRulesDeleted` (`ensure.go:658-663`) picks them up. This is
+  not covered by any existing integration test. Recommendation: add a
+  test that creates a dual-stack shoot with an `Ingress` resource that
+  causes `ingress-gce` to write firewall rules, then verifies cleanup on
+  shoot delete.
 
-- **Non-firewall resources leak on shoot deletion.** Global forwarding rules,
-  backend services, health checks, URL maps, target proxies, and NEGs live
-  outside the VPC. Our reconciler's cleanup only touches VPC-scoped resources
-  (firewall rules, routes). If `ingress-gce` is unhealthy at shoot-deletion
-  time, all of these leak into the user's project as untagged orphans. This
-  is a footgun regardless of BYO mode, but BYO amplifies it because BYO users
-  are more likely to be running `ingress-gce`. Mitigation: document that
-  `ingress-gce` users must delete all `Ingress` resources before shoot
-  deletion (this triggers `ingress-gce` to clean up its LB resources), and
-  ideally add a shoot-annotation-driven prevention or a `PreDelete` hook.
+- **Non-firewall resources leak on shoot deletion.** Global forwarding
+  rules, backend services, health checks, URL maps, target proxies, and
+  NEGs live outside the VPC. Our reconciler's cleanup only touches
+  VPC-scoped resources (firewall rules, routes). If `ingress-gce` is
+  unhealthy at shoot-deletion time, all of these leak into the user's
+  project as untagged orphans. This affects every dual-stack shoot today,
+  BYO or not. Mitigation: document that all `Ingress` resources must be
+  deleted before shoot deletion; consider a `PreDelete` hook that scales
+  the `ingress-gce` deployment to zero only after confirming all
+  Ingress-owned resources are gone.
 
 - **Cross-project (Shared VPC) permission compounding.** In a shared-VPC
-  scenario, the CCM already needs cross-project firewall permissions.
-  `ingress-gce` adds cross-project **and** cross-project-quota pressure —
-  every Ingress creates NEGs and backends in the service project plus
-  firewall rules in the host project. Debugging permission errors becomes
-  significantly harder. Mitigation: if we ship shared-VPC support, ship a
-  preflight validator that lists every required IAM permission for both CCM
-  and `ingress-gce` and checks them at admission time.
+  scenario (future work), the CCM already needs cross-project firewall
+  permissions. `ingress-gce` adds cross-project **and** cross-project-quota
+  pressure — every Ingress creates NEGs and backends in the service project
+  plus firewall rules in the host project. Debugging permission errors
+  becomes significantly harder. Mitigation: when shipping shared-VPC
+  support, ship a preflight validator that lists every required IAM
+  permission for both CCM and `ingress-gce` and checks them at admission
+  time.
 
 - **`BackendConfig` / `FrontendConfig` CRDs.** `ingress-gce` reads these
   CRDs to configure Cloud Armor, IAP, CDN, and SSL policies. These are
@@ -1192,26 +1362,43 @@ creates specific risks.
   Gardener has no visibility. If the user later deletes the CR, the
   Cloud Armor policy is deleted with it — which may be intended or may be
   catastrophic (e.g. shared policy across shoots). No mitigation from our
-  side; document as a `ingress-gce` operational concern.
+  side; document as an operational concern.
 
 - **NEG cleanup race.** Container-native LB via `ingress-gce` creates NEGs
   attached to node instances. When MCM churns machines, NEGs get modified.
   When a shoot deletes, MCM removes the VMs, but `ingress-gce`'s NEG
-  bookkeeping can lag. Result: orphan NEGs referencing non-existent VMs. Not
-  a hard blocker but visible in the user's project.
+  bookkeeping can lag. Result: orphan NEGs referencing non-existent VMs.
+  Not a hard blocker but visible in the user's project.
 
-- **Route quota exhaustion.** With CCM route controller + `ingress-gce` + any
-  user-side routes, the default 400-routes-per-VPC quota is hit sooner on
-  large or dense multi-shoot deployments. In BYO mode this is entirely the
-  user's VPC to manage, but we should still document the quota so users can
-  plan for the extension quota bump (up to 1000 via support).
+- **Internal HTTP(S) Load Balancer via `ingress-gce` requires a
+  proxy-only subnet.** GCP requires a subnet with `purpose:
+  REGIONAL_MANAGED_PROXY, role: ACTIVE` for Internal HTTP(S) LBs (used
+  under the hood by `ingress-gce` for internal-scheme Ingresses). Gardener
+  provisions **no** such subnet in either managed or BYO mode today. Users
+  of Internal Ingress must pre-provision one. Documented as a known gap
+  (§3.1 future-work item).
 
-**Recommendation for v1**: explicitly document `ingress-gce` as an add-on
-that is compatible with BYO mode but has known cleanup edge cases. Do not
-integrate it into the extension's deletion path (out of scope). Do add an
-integration test that installs `ingress-gce` on a BYO shoot and verifies
-firewall-rule cleanup on shoot delete — this is the one edge that our own
-reconciler can regress on.
+- **Version pinning.** The `ingress-gce` image is deployed via
+  `charts/internal/seed-controlplane/charts/ingress-gce/`. Its version
+  should be tracked against upstream. Naming-convention drift (e.g. the
+  historical `-l7-` infix addition) could silently break our
+  firewall-rule cleanup filter. Recommendation: pin the version in the
+  chart and add a release-note gate for upgrades.
+
+- **Route quota exhaustion.** With CCM route controller + `ingress-gce` +
+  any user-side routes, the default 400-routes-per-VPC quota is hit sooner
+  on large or dense multi-shoot deployments. In BYO mode this is entirely
+  the user's VPC to manage, but we should still document the quota so
+  users can plan for the extension quota bump (up to 1000 via support).
+
+**Recommendation for v1**: document `ingress-gce` as a Gardener-shipped
+component for dual-stack shoots that is compatible with BYO mode but has
+known operational edge cases (LB resource leaks, proxy-only-subnet
+requirement for Internal Ingress). Add an integration test that installs
+`ingress-gce` on a BYO dual-stack shoot and verifies firewall-rule cleanup
+on shoot delete — this is the one edge that our own reconciler can regress
+on. Consider a `PreDelete` hook that verifies zero remaining LB resources
+before finalizing shoot deletion.
 
 ### 6.3 Route-controller vs. alias-IP transition
 
