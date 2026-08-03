@@ -155,9 +155,62 @@ For readers less familiar with GCP:
 
 ## Proposal
 
+### Resource summary
+
+The table below inventories every GCP resource the extension currently
+creates or references, and states what happens to each one in BYO mode.
+"Managed" rows are today's behavior, kept as-is; "BYO" rows are the change
+introduced by this proposal.
+
+**Per-shoot resources created by the infrastructure reconciler:**
+
+| # | Resource | Managed mode | BYO mode |
+|---|---|---|---|
+| 1 | GCP IAM Service Account | created (`<technicalID>`) | unchanged — still created |
+| 2 | VPC network | created (`<technicalID>`) unless `Networks.VPC.Name` set | required BYO reference (`Networks.VPC.Name`) — verify-only |
+| 3 | Worker subnetwork (`PurposeNodes`) | created (`<technicalID>-nodes`) | required BYO reference (`Networks.SubnetNodes.Name`) — verify-only |
+| 4 | Internal subnetwork (`PurposeInternal`) | created (`<technicalID>-internal`) if `Networks.Internal` set | forbidden; internal LB IPs allocate from the workers subnet via `subnetwork-name` fallback in `cloudprovider.conf` |
+| 5 | Services subnetwork (`PurposeServices`) | created (`<technicalID>-services`), dual-stack only | dual-stack: required BYO reference (`Networks.SubnetServices.Name`) — verify-only. IPv4: N/A |
+| 6 | Cloud Router | created (`<technicalID>-cloud-router`) unless `Networks.VPC.CloudRouter.Name` set | forbidden; user manages any router out-of-band |
+| 7 | Cloud NAT gateway | created on the Cloud Router | not created; user manages egress out-of-band |
+| 8 | Cloud NAT external IPs | auto-allocated, or referenced via `Networks.CloudNAT.NatIPNames` | N/A — no NAT |
+| 9 | Firewall rule `<technicalID>-allow-internal-access` (IPv4) | created, untargeted (matches every VM in the VPC) | not created; user pre-provisions equivalent (recommended: tag-scoped to `<technicalID>`) |
+| 10 | Firewall rule `<technicalID>-allow-health-checks` (IPv4) | created, untargeted | not created; user pre-provisions equivalent |
+| 11 | Firewall rule `<technicalID>-allow-internal-access-ipv6` | created, untargeted, dual-stack only | dual-stack: not created; user pre-provisions equivalent |
+| 12 | Firewall rule `<technicalID>-allow-health-checks-ipv6` | created, untargeted, dual-stack only | dual-stack: not created; user pre-provisions equivalent |
+| 13 | IPv6 CIDR assignment on subnets | waited-for during reconcile, dual-stack only | N/A — user's subnets bring their own IPv6 CIDRs already |
+| 14 | Alias-IP ranges on worker VMs (instance-scoped, dual-stack) | written per-VM by MCM using the workers subnet's secondary range `ipv4-pod-cidr` | dual-stack: written per-VM by MCM using the workers subnet's secondary range named by `SubnetNodes.PodSecondaryRangeName` |
+
+**Per-Bastion resources (bastion controller):**
+
+| # | Resource | Managed mode | BYO mode |
+|---|---|---|---|
+| 15 | Bastion VM + disk + NIC + external PIP | created; NIC attaches to workers subnet | unchanged; NIC attaches to BYO workers subnet |
+| 16 | Firewall rule `<base>-allow-ssh` | created, tag-scoped to bastion VM | unchanged |
+| 17 | Firewall rule `<base>-egress-worker` | created, tag-scoped to bastion VM | unchanged; reads `WorkersCIDR` from `InfrastructureStatus.Networks.Subnets[?Purpose=PurposeNodes]` instead of `Networks.Workers` |
+| 18 | Firewall rule `<base>-deny-all` | created, tag-scoped to bastion VM | unchanged |
+
+**Resources written at runtime by upstream controllers (not by this extension):**
+
+| # | Resource | Written by | Managed mode | BYO mode |
+|---|---|---|---|---|
+| 19 | Custom routes `shoot--*` (per-node pod CIDR) | CCM route controller | written to Gardener-managed VPC (single-stack IPv4 only) | written to BYO VPC (single-stack IPv4 only) |
+| 20 | Firewall rules `k8s-fw-*` (per LB Service) | CCM LB controller | tag-scoped to `<technicalID>` in Gardener-managed VPC | tag-scoped to `<technicalID>` in BYO VPC — composes with user's rules |
+| 21 | Firewall rules `k8s-fw-l7-*`, forwarding rules, backends, health checks, NEGs, IPv6 LB frontends | `ingress-gce` (dual-stack only) | in Gardener-managed VPC + project | in BYO VPC + user's project |
+
+**Cleanup on shoot delete:**
+
+| # | What | Managed mode | BYO mode |
+|---|---|---|---|
+| Rows 1-14 | Resources created by the infrastructure reconciler | deleted by the reconciler | not created, nothing to delete |
+| Rows 15-18 | Bastion resources | deleted by bastion controller on Bastion CR delete | unchanged |
+| Row 19 | CCM custom routes | deleted by `ensureKubernetesRoutesDeleted` | deleted by `ensureKubernetesRoutesDeleted` — same filter, works against BYO VPC |
+| Row 20 | CCM firewall rules | deleted by `ensureFirewallRulesDeleted` (filter: `k8s`-prefix + `TargetTag = <technicalID>`) | same filter, same behavior |
+| Row 21 | `ingress-gce` resources | cleaned up by `ingress-gce` when owning `Ingress` / `Service` deleted; firewall rules also swept by `ensureFirewallRulesDeleted` | same, but user's project retains any leaked global resources if `ingress-gce` deletion did not complete cleanly |
+
 ### API changes
 
-One new optional field on `NetworkConfig`
+Two new optional fields on `NetworkConfig`
 (`pkg/apis/gcp/types_infrastructure.go` + v1alpha1 mirror):
 
 ```go
@@ -165,19 +218,28 @@ One new optional field on `NetworkConfig`
 type NetworkConfig struct {
     // ... existing fields (VPC, CloudNAT, Internal, Worker, Workers, FlowLogs, MTU) ...
 
-    // SubnetNodes is an optional reference to an already-existing subnetwork inside
-    // the user-provided VPC. When set, the infrastructure reconciler creates no
-    // network-layer resources in the user's VPC: it does not create or manage the
-    // worker subnetwork, the Cloud Router, Cloud NAT, or the static firewall rules.
-    // Firewall rules created at runtime by the cloud-controller-manager for
-    // Service type=LoadBalancer and by ingress-gce for dual-stack shoots are
-    // tag-scoped to worker VMs and continue to be created/deleted normally.
+    // SubnetNodes is an optional reference to an already-existing worker subnetwork
+    // inside the user-provided VPC. When set, the infrastructure reconciler creates
+    // no network-layer resources in the user's VPC: it does not create or manage the
+    // worker subnetwork, the services subnetwork, the Cloud Router, Cloud NAT, or
+    // the static firewall rules. Firewall rules created at runtime by the
+    // cloud-controller-manager for Service type=LoadBalancer and by ingress-gce for
+    // dual-stack shoots are tag-scoped to worker VMs and continue to be
+    // created/deleted normally.
     //
     // Requires Networks.VPC.Name to be set. Forbids Networks.VPC.CloudRouter,
     // Networks.Workers, Networks.Internal, Networks.CloudNAT, Networks.FlowLogs,
     // and Networks.MTU.
     // +optional
     SubnetNodes *SubnetReference `json:"subnetNodes,omitempty"`
+
+    // SubnetServices is an optional reference to an already-existing subnetwork
+    // used to allocate the IPv6 services CIDR (see the dual-stack specifics
+    // section for details). Required together with SubnetNodes for dual-stack
+    // shoots. Forbidden for single-stack IPv4 shoots and forbidden without
+    // SubnetNodes.
+    // +optional
+    SubnetServices *SubnetReference `json:"subnetServices,omitempty"`
 }
 
 // SubnetReference references an existing subnetwork in an existing VPC.
@@ -186,21 +248,27 @@ type SubnetReference struct {
     Name string `json:"name"`
 
     // PodSecondaryRangeName is the name of the secondary IP range on the
-    // referenced subnetwork carrying the pod CIDR. Required for dual-stack
-    // shoots. Ignored for single-stack IPv4 shoots.
+    // referenced subnetwork carrying the IPv4 pod CIDR (used with alias-IP
+    // pod IPAM). Required on SubnetNodes for dual-stack shoots. Ignored
+    // (and rejected by validation) on SubnetNodes for single-stack IPv4
+    // shoots and on SubnetServices in all cases.
     // +optional
     PodSecondaryRangeName *string `json:"podSecondaryRangeName,omitempty"`
 }
-
-// SubnetServices is an optional reference to an already-existing subnetwork used
-// for the IPv6 services CIDR. Required together with SubnetNodes for dual-stack
-// shoots; forbidden for single-stack IPv4 shoots and forbidden without SubnetNodes.
-// +optional
-SubnetServices *SubnetReference `json:"subnetServices,omitempty"`
 ```
 
 No new status enum. Mode is inferred from `SubnetNodes` presence (see
 [Derived mode](#derived-mode)).
+
+**Summary of subnets and ranges the extension references** (BYO mode):
+
+| Shoot networking | Worker subnetwork (`SubnetNodes`) | Services subnetwork (`SubnetServices`) |
+|---|---|---|
+| Single-stack IPv4 | Primary IPv4 range only. No secondary range. | Not used. |
+| Dual-stack | Primary IPv4 range + secondary IPv4 range for pods (`PodSecondaryRangeName`) + external IPv6 `/64`. | External IPv6 `/64`. No secondary range. |
+
+See [Dual-stack specifics](#dual-stack-specifics) for what each range is
+used for.
 
 ### Derived mode
 
@@ -410,6 +478,22 @@ Users MAY omit `--target-tags` to make the rules VPC-wide, matching today's
 Gardener behavior exactly. Tag-scoping is strictly recommended for shared
 BYO VPCs.
 
+**Aside — why the recommendation is stronger than what Gardener does today.**
+The four static rules created by the reconciler today are explicitly
+untargeted — `NullFields` in `ensure_utils.go:264` nulls `TargetTags` and
+`TargetServiceAccounts`, so every VM in the VPC is a valid destination. This
+is workable in single-owner VPCs but permissive in shared VPCs where other
+workloads exist. Every worker VM already carries the shoot's technical ID as
+a network tag (`pkg/controller/worker/machines.go:232-237`), so the scope
+information exists; today's static rules simply don't use it. Users
+replacing these rules in BYO mode are recommended to close that gap. The CCM
+runtime rules (`k8s-fw-*`) and bastion rules already tag-scope to the same
+technical ID, so the composed rule set is consistent.
+
+Tightening the reconciler's own static rules in managed mode to also
+tag-scope is a natural follow-up but out of scope here — see [Out of
+scope](#out-of-scope).
+
 ### Bastion
 
 Bastion works as-is in BYO mode, with one plumbing correction:
@@ -463,23 +547,49 @@ mirror `removeBYOResourceLabels` in the delete graph.
 
 ### Dual-stack specifics
 
+Dual-stack shoots require the user to pre-provision **two** subnetworks in
+the BYO VPC (workers + services), with specific ranges configured on each.
+
+**Subnetworks and ranges the extension references:**
+
+| Subnetwork | Referenced by | Ranges required on the subnet |
+|---|---|---|
+| Worker subnetwork | `Networks.SubnetNodes.Name` | Primary IPv4 range (a subset of `shoot.spec.networking.nodes`), plus a secondary IPv4 range named by `Networks.SubnetNodes.PodSecondaryRangeName` with `ipCidrRange` equal to `shoot.spec.networking.pods`, plus an external IPv6 CIDR (`stackType: IPV4_IPV6`, `ipv6AccessType: EXTERNAL`; GCP assigns a `/64` when the subnet is created). |
+| Services subnetwork | `Networks.SubnetServices.Name` | An external IPv6 CIDR (`stackType: IPV4_IPV6`, `ipv6AccessType: EXTERNAL`). No secondary range. Primary IPv4 range must exist (GCP requires one on every subnet) but is unused by Gardener. |
+
+**How each range is used at runtime:**
+
+| Range | Consumer | Purpose |
+|---|---|---|
+| Worker subnet primary IPv4 | GCE, CCM, bastion | Worker VM NIC IP allocation, node CIDR reporting, bastion NIC subnet. Also used as the default subnet for internal Load Balancer forwarding-rule IP allocation via `subnetwork-name` in `cloudprovider.conf`. |
+| Worker subnet secondary IPv4 (`PodSecondaryRangeName`) | CCM Cloud Allocator, MCM | Pod IPv4 alias-IP allocation. Each worker VM receives a `/24` (or shoot-configured size) slice of this range. |
+| Worker subnet IPv6 `/64` | CCM Cloud Allocator, ingress-gce | Each worker VM receives a `/96` slice from GCP; the Cloud Allocator sub-allocates `/112` per pod. IPv6 LB forwarding rules also allocate their VIP from this `/64`. |
+| Services subnet IPv6 `/64` | Extension reconciler | The extension reads the assigned `/64` and slices out a `/108` for the IPv6 services CIDR (`shoot.spec.networking.services`, IPv6 family). This workaround exists because GCP does not permit reserving a specific IPv6 range — a subnet must be provisioned so GCP assigns one. |
+
+**Component interactions in dual-stack:**
+
 - `ingress-gce` is deployed in the seed control plane
   (`valuesprovider.go:484-491`, gated on `IsDualStackEnabled(...)`) to
-  provision IPv6 Load Balancers, which the CCM does not support.
-- The BYO worker subnet must be dual-stack (`stackType: IPV4_IPV6`) with an
-  external IPv6 `/64` assigned by GCP.
-- Pod IPAM uses alias IPs on the workers subnet. The user's secondary range,
-  named by `SubnetNodes.PodSecondaryRangeName`, must have `ipCidrRange`
-  equal to `shoot.spec.networking.pods`.
-- The IPv6 services CIDR is sliced (as a `/108`) from the BYO services
-  subnet's external IPv6 `/64`. The user provisions this subnet;
-  `Networks.SubnetServices` references it.
-- No custom VPC routes are written by the CCM in dual-stack mode.
-- `ingress-gce` writes additional firewall rules (`k8s-fw-l7-*`, tag-scoped)
-  and L7 resources (forwarding rules, backend services, health checks,
-  NEGs). Firewall rules are cleaned up by
-  `ensureFirewallRulesDeleted`; L7 global resources are cleaned up by
-  `ingress-gce` itself when `Ingress` / `Service` objects are deleted.
+  provision dual-stack (IPv4, IPv6) Load Balancers, which the CCM does not
+  support alone.
+- Both the CCM's `cloudprovider.conf` and the `cloud-provider-config-ingress-gce`
+  ConfigMap reference the BYO worker subnetwork as `subnetwork-name`.
+- No custom VPC routes are written by the CCM in dual-stack mode; pod-to-pod
+  traffic uses alias IPs on the workers subnet.
+- Firewall rules written by `ingress-gce` (`k8s-fw-l7-*`) are tag-scoped to
+  the shoot technical ID and are cleaned up on shoot delete by the same
+  filter that catches CCM-written rules.
+
+**Sizing considerations (documented for users):**
+
+- Worker subnet primary IPv4 range must be sized for worker VMs plus any
+  internal Load Balancer forwarding-rule IPs (typically few).
+- Worker subnet secondary IPv4 range must be at least the size implied by
+  `shoot.spec.networking.pods` (the extension verifies equality).
+- Worker subnet IPv6 `/64` is assigned by GCP at subnet creation; per-VM
+  `/96` and per-pod `/112` allocations come from this range.
+- Services subnet IPv6 `/64` is likewise GCP-assigned; only a `/108` slice
+  is used.
 
 ## Configuration patterns
 
@@ -581,13 +691,20 @@ Before creating a BYO shoot the user MUST provide:
 
 1. A VPC network.
 2. A worker subnetwork inside that VPC in the shoot's region, with primary
-   CIDR that is a subset of `shoot.spec.networking.nodes` and non-overlapping
-   with `shoot.spec.networking.{pods,services}`.
-3. (Dual-stack) `stackType: IPV4_IPV6` on the worker subnet, an external IPv6
-   CIDR, and a secondary IPv4 range for pods with CIDR exactly equal to
-   `shoot.spec.networking.pods`.
-4. (Dual-stack) A services subnetwork with `stackType: IPV4_IPV6` and an
-   external IPv6 CIDR.
+   IPv4 CIDR that is a subset of `shoot.spec.networking.nodes` and
+   non-overlapping with `shoot.spec.networking.{pods,services}`.
+3. (Dual-stack only) The worker subnetwork additionally configured with:
+   - `stackType: IPV4_IPV6` and `ipv6AccessType: EXTERNAL` — GCP assigns an
+     external `/64` IPv6 CIDR at subnet creation.
+   - A secondary IPv4 range with `ipCidrRange` **exactly equal** to
+     `shoot.spec.networking.pods`. The name is arbitrary and passed into
+     `Networks.SubnetNodes.PodSecondaryRangeName`.
+4. (Dual-stack only) A separate services subnetwork in the same VPC and
+   region, with `stackType: IPV4_IPV6` and `ipv6AccessType: EXTERNAL`.
+   A primary IPv4 range is required by GCP (any small non-overlapping range
+   will do; it is unused by Gardener) and no secondary range is needed. The
+   extension slices a `/108` out of this subnet's `/64` for the IPv6
+   services CIDR.
 5. Firewall rules on the VPC allowing intra-shoot traffic and GCP LB
    health-check probes to worker VMs. See [Firewall-rule mutation
    contract](#firewall-rule-mutation-contract) for the concrete `gcloud`
@@ -596,8 +713,9 @@ Before creating a BYO shoot the user MUST provide:
    user-owned Cloud Router, a `0.0.0.0/0` route to an NVA / VPN /
    Interconnect, or no default route for network-isolated shoots.
 7. IAM permissions on the project owning the BYO VPC such that Gardener's
-   GCP principal can create/update/delete firewall rules and (in single-stack
-   IPv4) custom routes at runtime for the CCM and bastion controller.
+   GCP principal can create/update/delete firewall rules and (in
+   single-stack IPv4) custom routes at runtime for the CCM and bastion
+   controller.
 
 The user MUST NOT:
 
